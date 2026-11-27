@@ -1,0 +1,404 @@
+/*
+ * FRDM-K64F + Multi-function shield + DFPlayer Mini (Keil uVision 5)
+ *
+ * Connections:
+ *   DFPlayer VCC -> 5V      DFPlayer GND -> GND
+ *   DFPlayer TX  -> D0 (PTC16 = UART3_RX)
+ *   DFPlayer RX  -> D1 (PTC17 = UART3_TX) via 1k resistor
+ *   Speaker      -> SPK_1 / SPK_2
+ *
+ * Shield (Multi-function shield):
+ *   74HC595 : LATCH = D4 (PTB23), CLK = D7 (PTC3), DATA = D8 (PTC12)
+ *   LED D1..D4 = D13, D12, D11, D10 = PTD1, PTD3, PTD2, PTD0 (active low)
+ *   Buttons S1, S2, S3 = A1, A2, A3 = PTB3, PTB10, PTB11 (active low)
+ *
+ * SD card : FAT32, folder "mp3", files 0001.mp3, 0002.mp3, ...
+ */
+#include "MK64F12.h"
+#include <stdint.h>
+
+/* ---------------- Configuration ---------------- */
+#define VOLUME               30     /* 0-30 */
+#define TRACK_COUNT_DEFAULT  4      /* Fallback track count if DFPlayer does not respond */
+#define NAME_SHOW_MS         2000   /* Display duration (ms) when track starts */
+#define LED_PULSE_MS         1000   /* LED1 pulse duration on track change */
+#define DF_BOOT_MS           1500   /* Wait time for DFPlayer to boot */
+//EX
+#define NAME_SHOW_MS         7000
+
+/* ---------------- Pin Macros ---------------- */
+#define LATCH_H()  (PTB->PSOR = (1u << 23))
+#define LATCH_L()  (PTB->PCOR = (1u << 23))
+#define CLK_H()    (PTC->PSOR = (1u << 3))
+#define CLK_L()    (PTC->PCOR = (1u << 3))
+#define DATA_H()   (PTC->PSOR = (1u << 12))
+#define DATA_L()   (PTC->PCOR = (1u << 12))
+#define LED1_ON()  (PTD->PCOR = (1u << 1))   /* D1 = D13 */
+#define LED1_OFF() (PTD->PSOR = (1u << 1))
+#define LED2_ON()  (PTD->PCOR = (1u << 3))   /* D2 = D12 */
+#define LED2_OFF() (PTD->PSOR = (1u << 3))
+
+/* ---------------- 7-segment (common anode, active low) ---------------- */
+#define SEG_DASH 0xBF
+#define RXQ 8
+#define SCROLL_MS 300
+#define TITLE_COUNT (sizeof(TITLE) / sizeof(TITLE[0]))
+
+static const uint8_t SEG[10] = {
+    0xC0, 0xF9, 0xA4, 0xB0, 0x99, 0x92, 0x82, 0xF8, 0x80, 0x90
+};
+static const uint8_t DIGIT_SEL[4] = { 0xF1, 0xF2, 0xF4, 0xF8 }; /* Left -> Right */
+
+/* ---------------- State Variables ---------------- */
+static volatile uint32_t g_ms;
+static volatile uint32_t elapsed_ms;
+static volatile uint8_t  is_playing;
+static volatile uint8_t  disp_seg[4] = { SEG_DASH, SEG_DASH, SEG_DASH, SEG_DASH };
+static uint16_t cur_track = 1;
+static uint16_t total_tracks = TRACK_COUNT_DEFAULT;
+static uint8_t  is_paused;
+static uint8_t  led1_on;
+static uint32_t name_until;
+static uint32_t led1_off_at;
+static uint8_t  stop_cnt;
+static uint32_t last_status;
+
+/* Ring buffer for DFPlayer responses */
+static volatile uint8_t  q_cmd[RXQ];
+static volatile uint16_t q_par[RXQ];
+static volatile uint8_t  q_head, q_tail;
+
+/* ======================================================================
+ * 74HC595 + 7-segment Multiplexing
+ * ====================================================================== */
+static void shift_out(uint8_t b)
+{
+    uint8_t i;
+    for (i = 0; i < 8; i++) {
+        CLK_L();
+        if (b & 0x80) DATA_H(); else DATA_L();
+        __NOP(); __NOP();
+        CLK_H();
+        __NOP(); __NOP();
+        b <<= 1;
+    }
+}
+
+static void display_scan(void)
+{
+    static uint8_t idx;
+    LATCH_L();
+    shift_out(disp_seg[idx]);
+    shift_out(DIGIT_SEL[idx]);
+    LATCH_H();
+    idx = (idx + 1) & 3;
+}
+
+void SysTick_Handler(void)
+{
+    g_ms++;
+    if (is_playing) elapsed_ms++;
+    display_scan();
+}
+
+static void delay_ms(uint32_t n)
+{
+    uint32_t t = g_ms;
+    while ((g_ms - t) < n) { }
+}
+
+/* ======================================================================
+ * UART3 (9600 8N1) for DFPlayer
+ * ====================================================================== */
+static void rx_byte(uint8_t b)
+{
+    static uint8_t buf[10];
+    static uint8_t n;
+    if (n == 0) {
+        if (b == 0x7E) buf[n++] = b;
+        return;
+    }
+    buf[n++] = b;
+    if (n == 10) {
+        n = 0;
+        if (buf[9] == 0xEF) {
+            uint8_t nx = (uint8_t)((q_head + 1) % RXQ);
+            if (nx != q_tail) {
+                q_cmd[q_head] = buf[3];
+                q_par[q_head] = (uint16_t)((buf[5] << 8) | buf[6]);
+                q_head = nx;
+            }
+        }
+    }
+}
+
+void UART3_RX_TX_IRQHandler(void)
+{
+    uint8_t s1 = UART3->S1;
+    if (s1 & (UART_S1_RDRF_MASK | UART_S1_OR_MASK)) {
+        rx_byte(UART3->D);
+    }
+}
+
+static void uart3_init(uint32_t baud)
+{
+    uint32_t bus, x;
+    uint16_t sbr;
+    uint8_t  brfa;
+    SIM->SCGC4 |= SIM_SCGC4_UART3_MASK;
+    UART3->C2 = 0;
+    UART3->C1 = 0;
+    /* UART2-5 use the bus clock */
+    bus = SystemCoreClock /
+          (((SIM->CLKDIV1 & SIM_CLKDIV1_OUTDIV2_MASK) >> SIM_CLKDIV1_OUTDIV2_SHIFT) + 1);
+    x    = (2u * bus) / baud;          /* = bus / (16 * baud) * 32 */
+    sbr  = (uint16_t)(x >> 5);
+    brfa = (uint8_t)(x & 0x1F);
+    UART3->BDH = (UART3->BDH & ~UART_BDH_SBR_MASK) | ((sbr >> 8) & 0x1F);
+    UART3->BDL = (uint8_t)(sbr & 0xFF);
+    UART3->C4  = (UART3->C4 & ~UART_C4_BRFA_MASK) | UART_C4_BRFA(brfa);
+    UART3->C2 = UART_C2_TE_MASK | UART_C2_RE_MASK | UART_C2_RIE_MASK;
+    NVIC_EnableIRQ(UART3_RX_TX_IRQn);
+}
+
+static void uart3_putc(uint8_t b)
+{
+    while (!(UART3->S1 & UART_S1_TDRE_MASK)) { }
+    UART3->D = b;
+}
+
+/* Send 10-byte command frame to DFPlayer */
+static void df_send(uint8_t cmd, uint16_t param)
+{
+    uint8_t  f[10];
+    uint16_t sum = 0;
+    uint8_t  i;
+    f[0] = 0x7E; f[1] = 0xFF; f[2] = 0x06; f[3] = cmd; f[4] = 0x00;
+    f[5] = (uint8_t)(param >> 8);
+    f[6] = (uint8_t)(param & 0xFF);
+    for (i = 1; i <= 6; i++) sum += f[i];
+    sum = (uint16_t)(0u - sum);
+    f[7] = (uint8_t)(sum >> 8);
+    f[8] = (uint8_t)(sum & 0xFF);
+    f[9] = 0xEF;
+    for (i = 0; i < 10; i++) uart3_putc(f[i]);
+    while (!(UART3->S1 & UART_S1_TC_MASK)) { }
+}
+
+/* ======================================================================
+ * Playback Control
+ * ====================================================================== */
+static void play_track(uint16_t n, uint8_t pulse_led)
+{
+    cur_track = n;
+    df_send(0x12, n);               /* Play file in "mp3" folder: 000n.mp3 */
+    elapsed_ms = 0;
+    is_paused  = 0;
+    is_playing = 1;
+    LED2_OFF();
+    name_until = g_ms + NAME_SHOW_MS;
+    if (pulse_led) {
+        LED1_ON();
+        led1_on = 1;
+        led1_off_at = g_ms + LED_PULSE_MS;
+    }
+}
+
+static uint16_t next_of(uint16_t n) { return (n >= total_tracks) ? 1 : (uint16_t)(n + 1); }
+static uint16_t prev_of(uint16_t n) { return (n <= 1) ? total_tracks : (uint16_t)(n - 1); }
+
+static void toggle_pause(void)
+{
+    if (is_playing) {
+        df_send(0x0E, 0);           /* Pause */
+        is_playing = 0;
+        is_paused  = 1;
+        LED2_ON();
+    } else if (is_paused) {
+        df_send(0x0D, 0);           /* Resume */
+        is_playing = 1;
+        is_paused  = 0;
+        LED2_OFF();
+    }
+}
+
+/* Handle responses queued from DFPlayer */
+static void poll_df(void)
+{
+    while (q_tail != q_head) {
+        uint8_t  c = q_cmd[q_tail];
+        uint16_t p = q_par[q_tail];
+        q_tail = (uint8_t)((q_tail + 1) % RXQ);
+        if (c == 0x48 && p > 0) {
+            total_tracks = p;                       /* Total files on SD card */
+        } else if (c == 0x3D && is_playing && elapsed_ms > 1000) {
+            play_track(next_of(cur_track), 1);      /* Track finished -> play next */
+        } else if (c == 0x42) {                     /* Playback status: 0 = stopped */
+            if ((p & 0xFF) == 0) {
+                if (is_playing && elapsed_ms > 3000 && ++stop_cnt >= 2) {
+                    stop_cnt = 0;
+                    play_track(next_of(cur_track), 1);
+                }
+            } else {
+                stop_cnt = 0;
+            }
+        }
+    }
+}
+
+/* ======================================================================
+ * Buttons & Display Formatting
+ * ====================================================================== */
+static uint8_t buttons_scan(void)           /* Debounced every 10 ms */
+{
+    static uint8_t cnt[3];
+    static const uint8_t pin[3] = { 3, 10, 11 };   /* PTB3, PTB10, PTB11 */
+    uint8_t ev = 0, i;
+    for (i = 0; i < 3; i++) {
+        if (!(PTB->PDIR & (1u << pin[i]))) {
+            if (cnt[i] < 10) cnt[i]++;
+            if (cnt[i] == 3) ev |= (uint8_t)(1u << i);
+        } else {
+            cnt[i] = 0;
+        }
+    }
+    return ev;
+}
+
+static void show_name(uint16_t n)           /* Show track number, e.g., 0001 */
+{
+    disp_seg[0] = SEG[(n / 1000) % 10];
+    disp_seg[1] = SEG[(n / 100) % 10];
+    disp_seg[2] = SEG[(n / 10) % 10];
+    disp_seg[3] = SEG[n % 10];
+}
+
+static void show_time(uint32_t sec)         /* Format mm.ss */
+{
+    uint32_t m = sec / 60, s = sec % 60;
+    if (m > 99) m = 99;
+    disp_seg[0] = SEG[m / 10];
+    disp_seg[1] = SEG[m % 10] & 0x7F;       /* Decimal point separator */
+    disp_seg[2] = SEG[s / 10];
+    disp_seg[3] = SEG[s % 10];
+}
+
+//EX
+/* ===== Scrolling Track Titles on 7-segment ===== */
+static const char * const TITLE[] = {
+    "",                     /* 0 unused */
+    "DONT STOP ME",         /* 0001 */
+    "BOHEMIAN RHAPSODY",    /* 0002 */
+    "LAST CHRISTMAS",       /* 0003 */
+    "PER YIM"               /* 0004 */
+};
+
+static uint8_t char_to_seg(char c)
+{
+    static const uint8_t LET[26] = {
+        0x88,0x83,0xC6,0xA1,0x86,0x8E,0xC2,0x89,0xF9,0xE1,0x89,0xC7,0xC8,
+        0xAB,0xC0,0x8C,0x98,0xAF,0x92,0x87,0xC1,0xC1,0xC1,0x89,0x91,0xA4
+    };
+    if (c >= 'a' && c <= 'z') c = (char)(c - 32);
+    if (c >= 'A' && c <= 'Z') return LET[c - 'A'];
+    if (c >= '0' && c <= '9') return SEG[c - '0'];
+    if (c == '-') return SEG_DASH;
+    return 0xFF;                            /* Blank segment */
+}
+
+static void show_title(uint16_t n)
+{
+    const char *s;
+    int len = 0, pos, d, idx;
+    if (n >= TITLE_COUNT || TITLE[n][0] == '\0') { show_name(n); return; }
+    s = TITLE[n];
+    while (s[len]) len++;
+    pos = (int)((g_ms - (name_until - NAME_SHOW_MS)) / SCROLL_MS);
+    for (d = 0; d < 4; d++) {
+        idx = pos + d - 4;
+        disp_seg[d] = (idx >= 0 && idx < len) ? char_to_seg(s[idx]) : 0xFF;
+    }
+}
+//EX
+
+/* ======================================================================
+ * GPIO Initialization
+ * ====================================================================== */
+static void gpio_init(void)
+{
+    SIM->SCGC5 |= SIM_SCGC5_PORTB_MASK | SIM_SCGC5_PORTC_MASK | SIM_SCGC5_PORTD_MASK;
+
+    /* 74HC595 */
+    PORTB->PCR[23] = PORT_PCR_MUX(1);
+    PORTC->PCR[3]  = PORT_PCR_MUX(1);
+    PORTC->PCR[12] = PORT_PCR_MUX(1);
+    PTB->PDDR |= (1u << 23);
+    PTC->PDDR |= (1u << 3) | (1u << 12);
+
+    /* Buttons (internal pull-up enabled) */
+    PORTB->PCR[3]  = PORT_PCR_MUX(1) | PORT_PCR_PE_MASK | PORT_PCR_PS_MASK;
+    PORTB->PCR[10] = PORT_PCR_MUX(1) | PORT_PCR_PE_MASK | PORT_PCR_PS_MASK;
+    PORTB->PCR[11] = PORT_PCR_MUX(1) | PORT_PCR_PE_MASK | PORT_PCR_PS_MASK;
+    PTB->PDDR &= ~((1u << 3) | (1u << 10) | (1u << 11));
+
+    /* LED D1..D4 (PTD0-3) active low */
+    PORTD->PCR[0] = PORT_PCR_MUX(1);
+    PORTD->PCR[1] = PORT_PCR_MUX(1);
+    PORTD->PCR[2] = PORT_PCR_MUX(1);
+    PORTD->PCR[3] = PORT_PCR_MUX(1);
+    PTD->PDDR |= 0x0F;
+    PTD->PSOR  = 0x0F;
+
+    /* UART3: D0 = PTC16 (RX), D1 = PTC17 (TX) */
+    PORTC->PCR[16] = PORT_PCR_MUX(3);
+    PORTC->PCR[17] = PORT_PCR_MUX(3);
+}
+
+/* ======================================================================
+ * main
+ * ====================================================================== */
+int main(void)
+{
+    uint32_t last_scan = 0, t0;
+    SystemCoreClockUpdate();
+    gpio_init();
+    uart3_init(9600);
+    SysTick_Config(SystemCoreClock / 1000);
+
+    /* Wait for DFPlayer to initialize (display shows ----) */
+    delay_ms(DF_BOOT_MS);
+    df_send(0x06, VOLUME);
+    delay_ms(100);
+    df_send(0x48, 0);                        /* Query total files on SD card */
+    t0 = g_ms;
+    while ((g_ms - t0) < 800) poll_df();
+    play_track(1, 0);                        /* Start playing first track */
+
+    for (;;) {
+        poll_df();
+
+        if (is_playing && (g_ms - last_status) >= 1000) {
+            last_status = g_ms;
+            df_send(0x42, 0);               /* Query playback status */
+        }
+
+        if ((g_ms - last_scan) >= 10) {
+            uint8_t ev;
+            last_scan = g_ms;
+            ev = buttons_scan();
+            if (ev & 0x01) play_track(prev_of(cur_track), 1);   /* S1 previous track */
+            if (ev & 0x02) toggle_pause();                      /* S2 pause/play */
+            if (ev & 0x04) play_track(next_of(cur_track), 1);   /* S3 next track */
+        }
+
+        /* Turn off LED1 after pulse duration */
+        if (led1_on && (int32_t)(g_ms - led1_off_at) >= 0) {
+            LED1_OFF();
+            led1_on = 0;
+        }
+
+        /* Display: scrolling title initially, then elapsed time */
+        if ((int32_t)(g_ms - name_until) < 0) show_title(cur_track);
+        else                                  show_time(elapsed_ms / 1000);
+    }
+}
